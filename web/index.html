@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scroll sequence demo</title>
+<script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/gsap.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/ScrollTrigger.min.js"></script>
+<script src="https://unpkg.com/lenis@1.1.13/dist/lenis.min.js"></script>
+<style>
+  :root {
+    --cream: #F4EDE6;
+    --olive: #404F1D;
+    --sage: #A8B87A;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--cream);
+    color: var(--olive);
+    font: 400 16px/1.4 "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .pad { min-height: 100vh; display: grid; place-items: center; text-align: center; padding: 8vw; }
+  h1 { font-size: clamp(28px, 5vw, 64px); text-transform: uppercase; letter-spacing: -0.02em; max-width: 16ch; }
+  .hint { margin-top: 1.5rem; font-size: 13px; letter-spacing: .14em; text-transform: uppercase; opacity: .55; }
+
+  /* --- sequence --- */
+  .seq { position: relative; height: 500vh; }          /* scroll distance */
+  .seq__sticky { position: sticky; top: 0; height: 100vh; overflow: hidden; }
+  canvas { display: block; width: 100%; height: 100%; opacity: 0; transition: opacity .6s ease; }
+  canvas.ready { opacity: 1; }
+
+  .caption {
+    position: absolute; left: 0; right: 0; bottom: 10vh;
+    text-align: center; text-transform: uppercase;
+    font-size: clamp(13px, 1.5vw, 20px); letter-spacing: .1em;
+    opacity: 0; transform: translateY(12px);
+  }
+
+  .loader {
+    position: absolute; inset: 0; display: grid; place-items: center;
+    font-size: 12px; letter-spacing: .2em; text-transform: uppercase;
+    transition: opacity .4s ease;
+  }
+  .loader.done { opacity: 0; pointer-events: none; }
+
+  .ver {
+    position: fixed; left: 14px; bottom: 14px; z-index: 10;
+    display: flex; gap: 6px;
+  }
+  .ver a {
+    font: 400 11px/1 ui-monospace, Menlo, Consolas, monospace;
+    letter-spacing: .04em; text-decoration: none;
+    color: var(--olive); background: rgba(64, 79, 29, .08);
+    padding: 8px 11px; border-radius: 6px;
+  }
+  .ver a[aria-current="true"] { background: var(--olive); color: var(--cream); }
+
+  .hud {
+    position: fixed; right: 14px; bottom: 14px; z-index: 10;
+    font: 400 11px/1.6 ui-monospace, Menlo, Consolas, monospace;
+    background: rgba(64, 79, 29, .08); padding: 8px 11px; border-radius: 6px;
+    letter-spacing: .04em; white-space: pre;
+  }
+</style>
+</head>
+<body>
+
+<section class="pad">
+  <div>
+    <h1>Scroll-scrubbed<br>image sequence</h1>
+    <p class="hint">↓ scroll</p>
+  </div>
+</section>
+
+<section class="seq" id="seq">
+  <div class="seq__sticky">
+    <canvas id="c"></canvas>
+    <div class="loader" id="loader">loading frames 0%</div>
+    <p class="caption" id="cap1">Each frame is an AVIF image</p>
+    <p class="caption" id="cap2">Scroll position picks the frame</p>
+  </div>
+</section>
+
+<section class="pad">
+  <div>
+    <h1>End of<br>sequence</h1>
+    <p class="hint">end of demo</p>
+  </div>
+</section>
+
+<nav class="ver" id="ver"></nav>
+<div class="hud" id="hud">-</div>
+
+<script>
+const TOTAL   = 144;
+const reduce  = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+/* When the browser restored the scroll position, ScrollTrigger cached its
+   measurements at the wrong position (the HUD got stuck at 100%). */
+if ("scrollRestoration" in history) history.scrollRestoration = "manual";
+
+/* --- sequence variants: switch with ?seq=split --- */
+const SEQS = {
+  solid: { dir: "frames",       label: "v1 · solid tablet" },
+  split: { dir: "frames_split", label: "v2 · center split" },
+  hinge: { dir: "frames_hinge", label: "v3 · hinged lid" },
+};
+const qs = new URLSearchParams(location.search).get("seq");
+const seqKey = SEQS[qs] ? qs : "hinge";
+const SEQ = SEQS[seqKey];
+const SRC = i => `${SEQ.dir}/frame_${String(i).padStart(4, "0")}.avif`;
+
+const canvas = document.getElementById("c");
+const ctx    = canvas.getContext("2d", { alpha: false });
+const loader = document.getElementById("loader");
+const hud    = document.getElementById("hud");
+
+const images = new Array(TOTAL);
+const ready  = new Array(TOTAL).fill(false);   // which frames can actually be drawn
+let loaded = 0, lastDrawn = -1;
+const state = { frame: 0 };
+
+/* If the sequence is only partly rendered (common while iterating), fall back
+   to the nearest loaded frame. Otherwise the canvas looks frozen. */
+function nearestReady(i) {
+  if (ready[i]) return i;
+  for (let d = 1; d < TOTAL; d++) {
+    if (ready[i - d]) return i - d;
+    if (ready[i + d]) return i + d;
+  }
+  return -1;
+}
+
+/* --- retina: cap dpr at 2, a 3x canvas on phones costs GPU time for no visible gain --- */
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  canvas.width  = Math.round(innerWidth  * dpr);
+  canvas.height = Math.round(innerHeight * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  lastDrawn = -1;
+  draw(Math.round(state.frame));
+}
+
+/* --- object-fit: cover --- */
+function draw(i) {
+  i = nearestReady(i);
+  if (i < 0 || i === lastDrawn) return;     // don't draw the same frame twice
+  const img = images[i];
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const cw = canvas.width / dpr, ch = canvas.height / dpr;
+  const s  = Math.max(cw / img.naturalWidth, ch / img.naturalHeight);
+  const w  = img.naturalWidth * s, h = img.naturalHeight * s;
+  ctx.drawImage(img, (cw - w) / 2, (ch - h) / 2, w, h);
+  lastDrawn = i;
+}
+
+function preload() {
+  return new Promise(res => {
+    for (let i = 0; i < TOTAL; i++) {
+      const img = new Image();
+      img.decoding = "async";
+      img.src = SRC(i + 1);
+      images[i] = img;
+      img.onload = () => { ready[i] = true; done(); };
+      img.onerror = done;                    // a missing frame must not block loading
+      function done() {
+        loaded++;
+        loader.textContent = `loading frames ${Math.round(loaded / TOTAL * 100)}%`;
+        if (loaded === TOTAL) res();
+      }
+    }
+  });
+}
+
+/* --- Lenis and ScrollTrigger sync (without it the scrub stutters) --- */
+function initScroll() {
+  if (reduce) return;                       // reduced motion: no smooth scrolling
+  const lenis = new Lenis({ lerp: 0.1 });
+  window.__lenis = lenis;                   // exposed for tests and automation
+  lenis.on("scroll", ScrollTrigger.update);
+  gsap.ticker.add(t => lenis.raf(t * 1000));
+  gsap.ticker.lagSmoothing(0);
+}
+
+document.getElementById("ver").innerHTML = Object.entries(SEQS)
+  .map(([k, v]) => `<a href="?seq=${k}" aria-current="${k === seqKey}">${v.label}</a>`)
+  .join("");
+
+async function start() {
+  resize();
+  addEventListener("resize", resize);
+  await preload();
+
+  const have = ready.filter(Boolean).length;
+  if (have < TOTAL) {
+    console.warn(`${have}/${TOTAL} frames loaded, the sequence is only partly rendered`);
+  }
+
+  loader.classList.add("done");
+  canvas.classList.add("ready");
+  draw(0);
+
+  gsap.registerPlugin(ScrollTrigger);
+  initScroll();
+
+  if (reduce) {
+    /* reduced motion: no scrub, show the last frame as a still */
+    draw(TOTAL - 1);
+    hud.textContent = "reduced motion: sequence disabled";
+    return;
+  }
+
+  /* Do NOT update the HUD from ScrollTrigger.onUpdate. It fires as soon as the
+     scroll position changes, before the scrub tween has caught up, and it does
+     not fire again when scrolling stops, so the final frame never shows.
+     The tween's onUpdate is the right place. */
+  const tw = gsap.to(state, {
+    frame: TOTAL - 1,
+    ease: "none",
+    scrollTrigger: {
+      trigger: "#seq",
+      start: "top top",
+      end: "bottom bottom",
+      scrub: 1,                             // the playhead takes 1 s to catch up with the scroll position
+    },
+    onUpdate: () => {
+      const i = Math.round(state.frame);
+      draw(i);
+      const p = tw.scrollTrigger ? tw.scrollTrigger.progress : 0;
+      hud.textContent =
+        `frame ${String(i + 1).padStart(3, " ")} / ${TOTAL}\n` +
+        `scroll ${(p * 100).toFixed(0).padStart(3, " ")}%` +
+        (have < TOTAL ? `\nMISSING ${have} / ${TOTAL} frames` : "");
+    },
+  });
+
+  /* layout is final once the frames have loaded, so refresh the measurements */
+  ScrollTrigger.refresh();
+
+  /* captions at set points in the sequence */
+  [["#cap1", 0.18, 0.40], ["#cap2", 0.55, 0.80]].forEach(([sel, inAt, outAt]) => {
+    gsap.timeline({
+      scrollTrigger: { trigger: "#seq", start: `${inAt * 100}% top`, end: `${outAt * 100}% top`, scrub: true },
+    })
+      .to(sel, { opacity: 1, y: 0, duration: 1, ease: "power2.out" })
+      .to(sel, { opacity: 1, y: 0, duration: 2 })
+      .to(sel, { opacity: 0, y: -12, duration: 1, ease: "power2.in" });
+  });
+}
+
+start();
+</script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+# Rendered frames, previews and test renders (all reproducible from the scripts)
+frames*/
+test*/
+*.mp4
+*.log
+web/frames*/
+__pycache__/
